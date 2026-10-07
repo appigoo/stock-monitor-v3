@@ -1,12 +1,20 @@
 import json
 import streamlit as st
+import altair as alt
 import yfinance as yf
 import pandas as pd
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title="交易計劃｜每分鐘 Telegram 監控", layout="wide")
+
+# 新版 Streamlit 用 width="stretch"；舊版沿用 use_container_width
+try:
+    _v = tuple(int(x) for x in st.__version__.split(".")[:2])
+except Exception:
+    _v = (0, 0)
+STRETCH = {"width": "stretch"} if _v >= (1, 52) else {"use_container_width": True}
 
 # ============================================================
 # 預設交易計劃（首次載入用，之後可在頁面上直接編輯）
@@ -134,6 +142,8 @@ def df_to_plans(df: pd.DataFrame):
 # ============================================================
 if "triggered" not in st.session_state:
     st.session_state.triggered = set()
+if "positions" not in st.session_state:
+    st.session_state.positions = {}
 if "last_refresh" not in st.session_state:
     st.session_state.last_refresh = None
 if "plan_df" not in st.session_state:
@@ -207,7 +217,8 @@ def calculate_rr(entry_price, stop, targets):
 # 取得 1 分鐘價格
 # ============================================================
 @st.cache_data(ttl=45, show_spinner=False)
-def get_latest_price(symbol):
+def get_history(symbol):
+    """回傳 1 分鐘 K 線 (Close, Volume)，含盤前盤后；失敗回傳 None。"""
     # prepost=True：包含盤前 (04:00–09:30 ET) 與盤后 (16:00–20:00 ET)
     # period="5d"：週末／夜間也能取得最後一筆成交價
     df = None
@@ -221,10 +232,9 @@ def get_latest_price(symbol):
             df = yf.download(symbol, period="5d", interval="1m",
                              auto_adjust=False, progress=False, prepost=True)
         except Exception:
-            return None, None, None
-
+            return None
     if df is None or df.empty:
-        return None, None, None
+        return None
 
     if isinstance(df.columns, pd.MultiIndex):
         close = df["Close"].iloc[:, 0]
@@ -233,12 +243,12 @@ def get_latest_price(symbol):
         close = df["Close"]
         volume = df["Volume"]
 
-    close = pd.to_numeric(close, errors="coerce").dropna()
-    volume = pd.to_numeric(volume, errors="coerce").dropna()
-    if close.empty:
-        return None, None, None
-
-    return float(close.iloc[-1]), close.index[-1], (int(volume.iloc[-1]) if not volume.empty else 0)
+    out = pd.DataFrame({
+        "Close": pd.to_numeric(close, errors="coerce"),
+        "Volume": pd.to_numeric(volume, errors="coerce"),
+    }).dropna(subset=["Close"])
+    out["Volume"] = out["Volume"].fillna(0)
+    return out if not out.empty else None
 
 # ============================================================
 # Telegram 訊息
@@ -287,16 +297,19 @@ with st.sidebar:
         value=False,
         help="預設關閉，避免夜間／休市時用舊價格誤發通知。",
     )
+    show_charts = st.checkbox("顯示當日走勢圖", value=True)
     st.caption(f"🕒 目前美東時間：{now_et().strftime('%Y-%m-%d %H:%M')}｜時段：**{get_session()}**")
 
     if st.button("🧪 發送 Telegram 測試"):
         ok, msg = send_telegram("✅ Streamlit 股票監控 Telegram 測試成功")
         (st.success if ok else st.error)(msg)
 
-    if st.button("🔄 重置今日通知狀態"):
+    if st.button("🔄 重置今日通知與持倉"):
         today = et_date()
         st.session_state.triggered = {x for x in st.session_state.triggered if not x.startswith(today)}
-        st.success("今日通知狀態已重置。")
+        st.session_state.positions = {k: v for k, v in st.session_state.positions.items()
+                                      if not k.startswith(today)}
+        st.success("今日通知與持倉追蹤已重置。")
 
 # ------------------------------------------------------------
 # 可編輯交易計劃
@@ -311,7 +324,7 @@ edited_df = st.data_editor(
     st.session_state.plan_df,
     key=f"plan_editor_{st.session_state.editor_ver}",
     num_rows="dynamic",
-    use_container_width=True,
+    **STRETCH,
     hide_index=True,
     column_config={
         "啟用": st.column_config.CheckboxColumn("啟用", default=True),
@@ -385,88 +398,331 @@ for symbol, p in plans.items():
         "目標": " / ".join(f"{x:.2f}" for x in p["targets"]),
         "R:R 約": p["rr"],
     })
-st.dataframe(pd.DataFrame(plan_rows), use_container_width=True, hide_index=True)
+st.dataframe(pd.DataFrame(plan_rows), **STRETCH, hide_index=True)
 
 st.divider()
 st.subheader("📡 即時監控")
 
+# ============================================================
+# 持倉追蹤（入場後追蹤止損／目標與 R 倍數）
+# ============================================================
+def sort_targets(plan):
+    # 由近到遠：多單由小到大，空單由大到小
+    return sorted(plan["targets"], reverse=(plan["direction"] == "SHORT"))
+
+def stop_trigger_level(plan):
+    stop = plan["stop"]
+    if isinstance(stop, tuple):
+        return max(stop) if plan["direction"] == "LONG" else min(stop)
+    return float(stop)
+
+def r_multiple(plan, entry_price, price):
+    stop = plan["stop"]
+    mid = sum(stop) / 2 if isinstance(stop, tuple) else float(stop)
+    risk = abs(entry_price - mid)
+    if risk <= 0:
+        return 0.0
+    move = price - entry_price if plan["direction"] == "LONG" else entry_price - price
+    return move / risk
+
+def update_position(plan, pos, price):
+    """依最新價更新持倉狀態；新事件（止損／目標）寫入 pos['events']。"""
+    if pos["closed"]:
+        return
+    r = r_multiple(plan, pos["entry"], price)
+    pos["last_r"] = r
+    pos["max_r"] = max(pos["max_r"], r)
+
+    level = stop_trigger_level(plan)
+    stopped = price <= level if plan["direction"] == "LONG" else price >= level
+    if stopped:
+        pos.update(stopped=True, closed=True, final_r=r)
+        pos["events"].append({"kind": "STOP", "price": price, "r": r})
+        return
+
+    for i, t in enumerate(sort_targets(plan)):
+        kind = f"T{i + 1}"
+        reached = price >= t if plan["direction"] == "LONG" else price <= t
+        if reached and kind not in pos["hit"]:
+            pos["hit"].append(kind)
+            pos["events"].append({"kind": kind, "price": price, "r": r})
+    if len(pos["hit"]) >= len(plan["targets"]):
+        pos.update(closed=True, final_r=r)
+
+def position_text(plan, pos):
+    if not pos:
+        return "—"
+    n, m = len(pos["hit"]), len(plan["targets"])
+    if pos["stopped"]:
+        return f"🛑 {pos['final_r']:+.2f}R"
+    if pos["closed"]:
+        return f"🏁 {pos['final_r']:+.2f}R（目標全達）"
+    return f"{pos['last_r']:+.2f}R（目標 {n}/{m}｜最高 {pos['max_r']:+.2f}R）"
+
+def build_event_alert(symbol, ev, plan, pos, timestamp, session):
+    dir_text = "🟢 做多" if plan["direction"] == "LONG" else "🔴 做空"
+    if ev["kind"] == "STOP":
+        head = f"🛑【止損觸發】{symbol}"
+    else:
+        head = f"🎯【目標 {ev['kind'][1:]} 達成】{symbol}"
+    targets = " / ".join(f"{x:.2f}" for x in sort_targets(plan))
+    return (
+        f"{head}\n\n"
+        f"方向：{dir_text}\n"
+        f"現價：${ev['price']:.2f}（{session}）\n"
+        f"入場參考價：${pos['entry']:.2f}\n"
+        f"止損：${format_stop(plan['stop'])}\n"
+        f"目標：${targets}\n"
+        f"目前損益：{ev['r']:+.2f}R\n\n"
+        f"⏰ {timestamp}\n"
+        f"⚠️ 價格提醒，不會自動下單。"
+    )
+
+# ============================================================
+# 時段倒數
+# ============================================================
+def fmt_delta(td):
+    mins = max(int(td.total_seconds() // 60), 0)
+    d, rem = divmod(mins, 1440)
+    h, m = divmod(rem, 60)
+    return (f"{d}天 " if d else "") + f"{h}小時 {m:02d}分"
+
+def next_session_change(t):
+    cur = get_session(t)
+    for off in range(0, 9):
+        day = (t + timedelta(days=off)).date()
+        for hh, mm in [(4, 0), (9, 30), (16, 0), (20, 0)]:
+            cand = datetime(day.year, day.month, day.day, hh, mm, tzinfo=ET)
+            if cand > t and get_session(cand) != cur:
+                return get_session(cand), cand
+    return None, None
+
+def next_regular_open(t):
+    for off in range(0, 9):
+        day = (t + timedelta(days=off)).date()
+        cand = datetime(day.year, day.month, day.day, 9, 30, tzinfo=ET)
+        if cand > t and cand.weekday() < 5:
+            return cand
+    return None
+
+def render_clock():
+    t = now_et()
+    cur = get_session(t)
+    nxt_name, nxt_t = next_session_change(t)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("美東時間", t.strftime("%m/%d %H:%M"))
+    c2.metric("目前時段", cur)
+    if nxt_t:
+        c3.metric(f"距離「{nxt_name}」", fmt_delta(nxt_t - t))
+    if cur == "盤中":
+        close_t = datetime(t.year, t.month, t.day, 16, 0, tzinfo=ET)
+        c4.metric("距離收盤", fmt_delta(close_t - t))
+    else:
+        op = next_regular_open(t)
+        if op:
+            c4.metric("距離開盤", fmt_delta(op - t))
+
+# ============================================================
+# 當日走勢圖（含入場區／止損／目標）
+# ============================================================
+def intraday_series(hist):
+    idx = hist.index
+    idx_et = idx.tz_convert(ET) if idx.tz is not None else idx
+    last_day = idx_et[-1].date()
+    mask = idx_et.date == last_day
+    s = hist["Close"][mask].copy()
+    s.index = idx_et[mask].tz_localize(None)
+    return s
+
+def render_chart(plan, s, price):
+    lo, hi = plan["entry"]
+    levels = [("止損", stop_trigger_level(plan))] + [("目標", t) for t in plan["targets"]]
+    visible = [(k, v) for k, v in levels if abs(v - price) / price <= 0.12]
+    hidden = [f"{k} {v:.2f}" for k, v in levels if abs(v - price) / price > 0.12]
+
+    vals = [float(s.min()), float(s.max()), lo, hi] + [v for _, v in visible]
+    pad = (max(vals) - min(vals)) * 0.05 or 1.0
+    scale = alt.Scale(domain=[min(vals) - pad, max(vals) + pad], zero=False)
+
+    line_df = s.rename("v").rename_axis("t").reset_index()
+    line = alt.Chart(line_df).mark_line(color="#4c78a8").encode(
+        x=alt.X("t:T", title=None), y=alt.Y("v:Q", scale=scale, title=None))
+    last = alt.Chart(line_df.tail(1)).mark_point(filled=True, size=70, color="#ff7f0e").encode(
+        x="t:T", y=alt.Y("v:Q", scale=scale))
+    band = alt.Chart(pd.DataFrame({"a": [lo], "b": [hi]})).mark_rect(
+        opacity=0.18, color="#2ca02c").encode(y=alt.Y("a:Q", scale=scale, title=None), y2="b:Q")
+
+    layers = [band, line, last]
+    if visible:
+        rules_df = pd.DataFrame(visible, columns=["kind", "v"])
+        rules = alt.Chart(rules_df).mark_rule(strokeDash=[5, 4]).encode(
+            y=alt.Y("v:Q", scale=scale),
+            color=alt.Color("kind:N", legend=None,
+                            scale=alt.Scale(domain=["止損", "目標"], range=["#d62728", "#1f77b4"])))
+        layers.append(rules)
+    return alt.layer(*layers).properties(height=170), hidden
+
+# ============================================================
+# 監控主流程
+# ============================================================
 def monitor():
-    rows = []
+    rows, chart_items = [], []
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     current_plans = st.session_state.plans
     session = get_session()
 
     for symbol, plan in current_plans.items():
-        price, data_time, volume = get_latest_price(symbol)
         entry_txt = f"${plan['entry'][0]:.2f}–${plan['entry'][1]:.2f}"
+        row = {
+            "代碼": symbol, "現價": "—", "狀態": "❌ 無法取得價格",
+            "距入場區": "—", "接近度": None, "持倉 R": "—",
+            "入場區": entry_txt, "止損": format_stop(plan["stop"]),
+            "目標": " / ".join(f"${x:.2f}" for x in plan["targets"]),
+            "Telegram": "—", "時段": session, "資料新鮮度": "—", "資料時間": "—",
+        }
 
-        if price is None:
-            rows.append({"代碼": symbol, "現價": "—", "入場區": entry_txt,
-                         "狀態": "❌ 無法取得價格", "Telegram": "—"})
+        hist = get_history(symbol)
+        if hist is None or hist.empty:
+            rows.append(row)
             continue
 
+        price = float(hist["Close"].iloc[-1])
+        data_time = hist.index[-1]
+        lo, hi = plan["entry"]
         in_zone = price_in_entry(price, plan["entry"])
         key = today_key(symbol, plan)
-        telegram_status = "—"
 
+        # --- 資料新鮮度 ---
         age = data_age_minutes(data_time)
         is_fresh = age is not None and age <= FRESH_MINUTES
         if is_fresh:
             data_note = f"✅ {age:.0f} 分鐘前"
         elif age is not None:
-            hrs = age / 60
-            data_note = f"⚠️ 過期 {hrs:.1f} 小時" if hrs >= 1 else f"⚠️ 過期 {age:.0f} 分鐘"
+            data_note = f"⚠️ 過期 {age / 60:.1f} 小時" if age >= 60 else f"⚠️ 過期 {age:.0f} 分鐘"
         else:
             data_note = "—"
+        can_track = is_fresh or allow_stale
 
+        # --- 距入場區 / 接近度 ---
+        if in_zone:
+            dist_pct, dist_txt = 0.0, "🟢 在入場區內"
+        elif price < lo:
+            dist_pct = (lo - price) / price * 100
+            dist_txt = f"{'🟡' if dist_pct < 2 else '⚪'} 差 {dist_pct:.1f}%（需上漲）"
+        else:
+            dist_pct = (price - hi) / price * 100
+            dist_txt = f"{'🟡' if dist_pct < 2 else '⚪'} 差 {dist_pct:.1f}%（需回落）"
+        closeness = max(0.0, 100.0 - dist_pct * 10)  # 距離 10% 以上為 0
+
+        # --- 入場通知 ---
+        status_parts = []
         if in_zone and key not in st.session_state.triggered:
             if session not in alert_sessions:
-                telegram_status = f"⏸ {session}未啟用通知"
-            elif not is_fresh and not allow_stale:
-                telegram_status = "⏸ 價格資料過期，暫不通知"
+                status_parts.append(f"⏸ {session}未啟用通知")
+            elif not can_track:
+                status_parts.append("⏸ 價格資料過期，暫不通知")
             else:
                 ok, msg = send_telegram(build_alert(symbol, price, plan, now, session))
                 if ok:
                     st.session_state.triggered.add(key)
-                    telegram_status = "✅ 已通知"
+                    status_parts.append("✅ 入場已通知")
                 else:
-                    telegram_status = f"❌ {msg}"
+                    status_parts.append(f"❌ {msg}")
         elif in_zone:
-            telegram_status = "已通知（今日不重複）"
+            status_parts.append("入場已通知（今日不重複）")
 
-        lo, hi = plan["entry"]
-        if in_zone:
+        # --- 持倉追蹤 ---
+        pos = st.session_state.positions.get(key)
+        if pos is None and in_zone and can_track:
+            pos = {"entry": price, "time": now, "hit": [], "stopped": False,
+                   "closed": False, "max_r": 0.0, "last_r": 0.0, "final_r": None,
+                   "events": [], "notified": []}
+            st.session_state.positions[key] = pos
+        if pos is not None and can_track:
+            update_position(plan, pos, price)
+        if pos is not None:
+            for ev in pos["events"]:
+                if ev["kind"] in pos["notified"]:
+                    continue
+                label = "止損" if ev["kind"] == "STOP" else f"目標{ev['kind'][1:]}"
+                if session not in alert_sessions:
+                    status_parts.append(f"⏸ {label}待發（{session}未啟用通知）")
+                    continue
+                ok, msg = send_telegram(build_event_alert(symbol, ev, plan, pos, now, session))
+                if ok:
+                    pos["notified"].append(ev["kind"])
+                    status_parts.append(f"✅ {label}已通知")
+                else:
+                    status_parts.append(f"❌ {msg}")
+
+        # --- 狀態文字 ---
+        if pos and pos["stopped"]:
+            state = "🛑 已止損"
+        elif pos and pos["closed"]:
+            state = "🏁 目標全達"
+        elif pos:
+            state = "📈 持倉追蹤中"
+        elif in_zone:
             state = "🟢 到達入場區"
         elif plan["direction"] == "LONG":
             state = "⏳ 等待價格上來" if price < lo else "⏳ 等待回踩"
         else:
             state = "⏳ 等待價格回落" if price > hi else "⏳ 等待反彈"
 
-        rows.append({
-            "代碼": symbol,
-            "現價": f"${price:.2f}",
-            "入場區": entry_txt,
-            "狀態": state,
-            "止損": format_stop(plan["stop"]),
-            "目標": " / ".join(f"${x:.2f}" for x in plan["targets"]),
-            "Telegram": telegram_status,
-            "時段": session,
-            "資料新鮮度": data_note,
-            "資料時間": str(data_time),
+        row.update({
+            "現價": f"${price:.2f}", "狀態": state,
+            "距入場區": dist_txt, "接近度": closeness,
+            "持倉 R": position_text(plan, pos),
+            "Telegram": "；".join(status_parts) if status_parts else "—",
+            "資料新鮮度": data_note, "資料時間": str(data_time),
         })
+        rows.append(row)
+        chart_items.append((symbol, plan, intraday_series(hist), price))
 
     st.session_state.last_refresh = now
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.dataframe(
+        pd.DataFrame(rows),
+        **STRETCH,
+        hide_index=True,
+        column_config={
+            "接近度": st.column_config.ProgressColumn(
+                "接近度", min_value=0, max_value=100, format="%d%%",
+                help="100% = 已在入場區；距離每增加 1% 減少 10%，10% 以上為 0"),
+        },
+    )
+
+    today = et_date()
+    todays = [v for k, v in st.session_state.positions.items() if k.startswith(today)]
+    if todays:
+        n_open = sum(1 for v in todays if not v["closed"])
+        n_stop = sum(1 for v in todays if v["stopped"])
+        n_done = sum(1 for v in todays if v["closed"] and not v["stopped"])
+        st.caption(f"📊 今日持倉追蹤：進行中 {n_open}｜已止損 {n_stop}｜目標全達 {n_done}")
+    return chart_items
 
 def live_panel():
-    monitor()
+    render_clock()
+    chart_items = monitor()
     st.caption(
         f"最後更新：{st.session_state.last_refresh}｜美東 {now_et().strftime('%H:%M:%S')}"
         f"｜時段：{get_session()}"
     )
+    if show_charts and chart_items:
+        st.subheader("📈 當日走勢與關鍵價位")
+        st.caption("綠帶＝入場區｜紅虛線＝止損｜藍虛線＝目標｜橘點＝最新價")
+        for i in range(0, len(chart_items), 2):
+            cols = st.columns(2)
+            for col, item in zip(cols, chart_items[i:i + 2]):
+                symbol, plan, s, price = item
+                with col:
+                    st.markdown(f"**{symbol}**　${price:.2f}")
+                    chart, hidden = render_chart(plan, s, price)
+                    st.altair_chart(chart, **STRETCH)
+                    if hidden:
+                        st.caption("圖外價位：" + "、".join(hidden))
 
 if st.button("⚡ 立即更新價格"):
-    get_latest_price.clear()  # 清除快取，強制重新抓取
+    get_history.clear()  # 清除快取，強制重新抓取
 
 # 表格與刷新都放在同一個 fragment 內：
 # 自動更新時每 60 秒只重跑這一塊，且只畫一次（不再從 fragment 外寫入）
