@@ -2,3 +2,7 @@ streamlit
 yfinance
 pandas
 requests
+altair
+ZoneInfo
+json
+datetime
